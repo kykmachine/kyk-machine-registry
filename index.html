@@ -430,6 +430,50 @@ pre.gs-code{background:var(--bg2);border:1px solid var(--border);border-radius:8
 </div>
 
 
+<!-- ══ IMPORT EXCEL MODAL ══ -->
+<div class="overlay" id="ovl-import">
+  <div class="modal" style="max-width:800px">
+    <div class="mh">
+      <div>
+        <div class="mh-title">📥 นำเข้าข้อมูลจาก Excel</div>
+        <div class="mh-sub" id="import-sub">กำลังอ่านไฟล์...</div>
+      </div>
+      <button class="btn-close" onclick="closeOverlay('ovl-import')">✕</button>
+    </div>
+    <div class="mb" style="padding:14px 22px">
+      <!-- summary -->
+      <div id="import-summary" style="display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap"></div>
+      <!-- preview table -->
+      <div style="overflow-x:auto;max-height:380px;overflow-y:auto;border:1px solid var(--border);border-radius:8px">
+        <table class="stbl" style="min-width:600px">
+          <thead><tr>
+            <th>#</th><th>Serial / PO</th><th>ชื่องาน</th><th>ลูกค้า</th><th>Site</th><th>สถานะ</th>
+          </tr></thead>
+          <tbody id="import-tbody"></tbody>
+        </table>
+      </div>
+      <!-- mode select -->
+      <div style="margin-top:14px;padding:12px 14px;background:var(--bg3);border:1px solid var(--border);border-radius:8px">
+        <div style="font-size:11px;color:var(--t3);font-family:var(--mono);margin-bottom:8px;letter-spacing:1px;text-transform:uppercase">วิธีนำเข้า</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <label style="display:flex;align-items:center;gap:7px;cursor:pointer;font-size:13px">
+            <input type="radio" name="import-mode" value="replace" checked style="accent-color:var(--accent)">
+            <span><b>แทนที่ทั้งหมด</b> — ลบข้อมูลเดิมแล้วใส่ใหม่</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:7px;cursor:pointer;font-size:13px">
+            <input type="radio" name="import-mode" value="merge" style="accent-color:var(--accent)">
+            <span><b>เพิ่มเข้า</b> — ข้ามรายการที่ PO ซ้ำ</span>
+          </label>
+        </div>
+      </div>
+    </div>
+    <div class="mf">
+      <button class="btn btn-secondary" onclick="closeOverlay('ovl-import')">ยกเลิก</button>
+      <button class="btn btn-primary" id="btn-confirm-import" onclick="confirmImport()">✅ นำเข้า</button>
+    </div>
+  </div>
+</div>
+
 <!-- SIDEBAR -->
 <nav id="sidebar">
   <div class="sb-logo">
@@ -491,6 +535,8 @@ pre.gs-code{background:var(--bg2);border:1px solid var(--border);border-radius:8
           <option value="cancelled">ยกเลิก</option>
         </select>
         <select class="sel" id="flt-type" onchange="renderMachines()"><option value="">ประเภททั้งหมด</option></select>
+        <input type="file" id="import-file-input" accept=".xlsx,.xls" style="display:none" onchange="handleImportFile(event)">
+        <button class="btn btn-secondary btn-sm" id="btn-import-excel" onclick="document.getElementById('import-file-input').click()" style="display:none">📥 นำเข้า Excel</button>
       </div>
       <div class="machine-grid" id="machine-grid"></div>
     </div>
@@ -1185,6 +1231,9 @@ function applyPermissions(){
   // ปุ่ม + เพิ่มอะไหล่ (Admin only)
   const btnSP = document.getElementById('btn-add-sp');
   if(btnSP) btnSP.style.display = can('add_machine') ? '' : 'none';
+  // ปุ่ม นำเข้า Excel (Admin only)
+  const btnImport = document.getElementById('btn-import-excel');
+  if(btnImport) btnImport.style.display = can('add_machine') ? '' : 'none';
 
   // re-render เพื่ออัปเดตปุ่ม edit/delete ใน card
   refreshAll();
@@ -2508,6 +2557,208 @@ function collectCustomFields(){
     if(el && el.value.trim()) result[f.key] = el.value.trim();
   });
   return result;
+}
+
+// ══════════════════════════════════════════
+//  IMPORT EXCEL (แผนผลิต KYK format)
+// ══════════════════════════════════════════
+let _importPending = [];
+
+function _thDate(s) {
+  if (!s) return '';
+  s = String(s).trim();
+  const m = s.match(/(\d{1,2})[./](\d{1,2})[./](\d{4})/);
+  if (!m) return '';
+  let [, d, mo, y] = m;
+  y = parseInt(y); if (y > 2400) y -= 543;
+  return y + '-' + String(mo).padStart(2,'0') + '-' + String(d).padStart(2,'0');
+}
+
+function _parsePoCust(s) {
+  if (!s) return ['', ''];
+  s = String(s).trim();
+  // try " - " separator first
+  const bySpace = s.split(' - ');
+  if (bySpace.length >= 2) return [bySpace[0].trim(), bySpace[1].trim()];
+  // fall back: split before first Thai character after an ASCII PO code
+  const m = s.match(/[-,]\s*([฀-๿])/);
+  if (m) {
+    const pos = s.indexOf(m[0]);
+    const po = s.slice(0, pos).trim();
+    const rest = s.slice(pos + m[0].length - 1).split(/[-]/)[0].trim();
+    return [po, rest];
+  }
+  return [s, ''];
+}
+
+function _inferType(name) {
+  const n = (name || '').toLowerCase();
+  if (/conveyor|สายพาน/.test(n)) return 'Conveyor System';
+  if (/label|สติ๊กเกอร์|applicator/.test(n)) return 'Label Applicator';
+  if (/vision|camera|iv4|iv3/.test(n)) return 'Vision System';
+  if (/inspect|ตรวจจับ|reject/.test(n)) return 'Inspection & Reject';
+  if (/packing|pack/.test(n)) return 'Packing Machine';
+  if (/hmi|จอ sk/.test(n)) return 'HMI';
+  if (/barcode|scanner/.test(n)) return 'Barcode Scanner';
+  if (/vacuum/.test(n)) return 'Vacuum System';
+  if (/traversing/.test(n)) return 'Traversing System';
+  if (/sensor|เซนเซอร์/.test(n)) return 'Sensor';
+  if (/belt/.test(n)) return 'Spare Part';
+  if (/กลึง|โครงสร้าง|ขาตั้ง|แกน/.test(n)) return 'Machine Part';
+  return 'Machine';
+}
+
+function _cellVal(row, idx) {
+  const cell = row[idx];
+  if (cell === undefined || cell === null) return '';
+  return String(cell).trim();
+}
+
+function _parseSheet(ws, status) {
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+  const result = [];
+  // header row = index 1, data starts index 3
+  for (let r = 3; r < rows.length; r++) {
+    const row = rows[r];
+    const name = _cellVal(row, 15);
+    if (!name) continue;
+    const poRaw   = _cellVal(row, 16);
+    const [po, cust] = _parsePoCust(poRaw);
+    const siteRaw = _cellVal(row, 17);
+    const contact = _cellVal(row, 18);
+    const orderDate = _thDate(_cellVal(row, 0));
+    const deliver   = _thDate(_cellVal(row, 5));
+    const notes   = _cellVal(row, 23);
+    let svc = _cellVal(row, 24);
+    if (svc) svc = svc.split(/[/,]/)[0].trim().slice(0, 20);
+
+    const yr = orderDate.slice(2,4) || '26';
+    const mo = orderDate.slice(5,7) || '01';
+    const serial = svc || ('KYK-' + yr + mo + '-' + String(result.length + 1).padStart(3,'0'));
+
+    result.push({
+      id: 'M' + Date.now() + '_' + r,
+      serial, po,
+      name: name.replace(/\s+/g,' '),
+      type: _inferType(name),
+      status,
+      customer: cust,
+      site: siteRaw,
+      contact, deliver, deliver,
+      deliverDate: deliver,
+      warEnd: '', warYears: null,
+      notes, imgUrl: '', docs: [],
+      customFields: {},
+      createdAt: new Date().toISOString()
+    });
+  }
+  return result;
+}
+
+function handleImportFile(e) {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  if (typeof XLSX === 'undefined') { toast('กำลังโหลด Excel library...','error'); return; }
+
+  const reader = new FileReader();
+  reader.onload = function(ev) {
+    try {
+      const wb = XLSX.read(ev.target.result, { type: 'array' });
+      _importPending = [];
+
+      // Map sheet name → status
+      const statusMap = {
+        'งานมาใหม่': 'production',
+        'ยังไม่ส่ง': 'production',
+        'production': 'production',
+        'ส่งแล้ว': 'delivered',
+        'delivered': 'delivered',
+      };
+
+      wb.SheetNames.forEach(function(sname) {
+        // detect status from sheet name
+        let status = 'production';
+        Object.keys(statusMap).forEach(function(k) {
+          if (sname.includes(k)) status = statusMap[k];
+        });
+        // only parse sheets that have at least 16 columns in row 1
+        const ws = wb.Sheets[sname];
+        const rows = XLSX.utils.sheet_to_json(ws, { header:1, defval:'' });
+        if (!rows[1] || rows[1].length < 16) return;
+        const items = _parseSheet(ws, status);
+        _importPending = _importPending.concat(items);
+      });
+
+      if (_importPending.length === 0) {
+        toast('ไม่พบข้อมูลเครื่องจักรในไฟล์นี้','error'); return;
+      }
+      _renderImportPreview(file.name);
+      openOverlay('ovl-import');
+    } catch(err) {
+      toast('อ่านไฟล์ไม่ได้: ' + err.message, 'error');
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function _renderImportPreview(filename) {
+  const prod = _importPending.filter(function(m){ return m.status==='production'; }).length;
+  const delv = _importPending.filter(function(m){ return m.status==='delivered'; }).length;
+
+  document.getElementById('import-sub').textContent =
+    filename + ' — พบ ' + _importPending.length + ' รายการ';
+
+  document.getElementById('import-summary').innerHTML =
+    '<div style="background:rgba(0,207,255,.08);border:1px solid rgba(0,207,255,.2);border-radius:6px;padding:8px 14px;font-size:12px">'
+    +'<span style="color:var(--accent);font-family:var(--mono);font-size:18px;font-weight:700">' + _importPending.length + '</span>'
+    +' <span style="color:var(--t2)">รายการทั้งหมด</span></div>'
+    +'<div style="background:rgba(180,138,251,.08);border:1px solid rgba(180,138,251,.2);border-radius:6px;padding:8px 14px;font-size:12px">'
+    +'<span style="color:var(--purple);font-family:var(--mono);font-size:18px;font-weight:700">' + prod + '</span>'
+    +' <span style="color:var(--t2)">กำลังผลิต</span></div>'
+    +'<div style="background:rgba(0,230,118,.08);border:1px solid rgba(0,230,118,.2);border-radius:6px;padding:8px 14px;font-size:12px">'
+    +'<span style="color:var(--green);font-family:var(--mono);font-size:18px;font-weight:700">' + delv + '</span>'
+    +' <span style="color:var(--t2)">ส่งมอบแล้ว</span></div>';
+
+  const stCls = { production:'b-prod', delivered:'b-active', service:'b-service', cancelled:'b-end' };
+  const stLbl = { production:'กำลังผลิต', delivered:'ส่งมอบแล้ว', service:'ส่งซ่อม', cancelled:'ยกเลิก' };
+
+  document.getElementById('import-tbody').innerHTML = _importPending.map(function(m, i) {
+    return '<tr>'
+      + '<td style="color:var(--t3);font-family:var(--mono)">' + (i+1) + '</td>'
+      + '<td style="font-family:var(--mono);font-size:11px"><div style="color:var(--accent)">' + (m.serial||'—') + '</div>'
+      + (m.po ? '<div style="color:var(--t3)">'+m.po+'</div>' : '') + '</td>'
+      + '<td style="max-width:200px;word-break:break-word">' + (m.name||'—')
+      + '<div style="font-size:10px;color:var(--t3)">' + m.type + '</div></td>'
+      + '<td>' + (m.customer||'—') + '</td>'
+      + '<td style="font-size:11px;color:var(--t2)">' + (m.site||'—') + '</td>'
+      + '<td><span class="badge ' + (stCls[m.status]||'b-active') + '">' + (stLbl[m.status]||m.status) + '</span></td>'
+      + '</tr>';
+  }).join('');
+}
+
+function confirmImport() {
+  const mode = document.querySelector('input[name="import-mode"]:checked')?.value || 'replace';
+  if (mode === 'replace') {
+    machines = _importPending.map(function(m, i) {
+      return Object.assign({}, m, { id: 'M' + String(i+1).padStart(3,'0') });
+    });
+    logs = [];
+  } else {
+    // merge — skip if same PO already exists
+    const existingPOs = new Set(machines.map(function(m){ return m.po; }).filter(Boolean));
+    let added = 0;
+    _importPending.forEach(function(m, i) {
+      if (m.po && existingPOs.has(m.po)) return;
+      machines.push(Object.assign({}, m, { id: 'M' + Date.now() + '_' + i }));
+      added++;
+    });
+    toast('เพิ่มเข้า ' + added + ' รายการ (ข้าม ' + (_importPending.length - added) + ' ที่ซ้ำ)', 'info');
+  }
+  markDirty(); scheduleAutoSave();
+  closeOverlay('ovl-import');
+  renderMachines(); updateBadges();
+  if (mode === 'replace') toast('นำเข้า ' + machines.length + ' เครื่องเรียบร้อย ✅', 'success');
 }
 
 async function init(){
